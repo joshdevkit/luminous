@@ -1,0 +1,172 @@
+<?php
+
+namespace Core\Database\Relations;
+
+use Core\Database\EloquentBuilder;
+use Core\Database\Model;
+use Core\Support\Collection;
+
+class HasOne extends Relation
+{
+    /**
+     * The foreign key of the parent model.
+     */
+    protected string $foreignKey;
+
+    /**
+     * The local key of the parent model.
+     */
+    protected string $localKey;
+
+    /**
+     * Create a new has one relationship instance.
+     */
+    public function __construct(EloquentBuilder $query, Model $parent, string $foreignKey, string $localKey)
+    {
+        $this->foreignKey = $foreignKey;
+        $this->localKey = $localKey;
+
+        parent::__construct($query, $parent);
+    }
+
+    /**
+     * Set the base constraints on the relation query.
+     */
+    public function addConstraints(): void
+    {
+        if (static::$constraints) {
+            $this->query->where(
+                $this->foreignKey,
+                '=',
+                $this->getParentKey()
+            );
+        }
+    }
+
+    /**
+     * Set the constraints for an eager load of the relation.
+     */
+    public function addEagerConstraints(array $models): void
+    {
+        $this->query->whereIn(
+            $this->foreignKey,
+            $this->getKeys($models, $this->localKey)
+        );
+    }
+
+    /**
+     * Initialize the relation on a set of models.
+     */
+    public function initRelation(array $models, string $relation): array
+    {
+        foreach ($models as $model) {
+            $model->setRelation($relation, null);
+        }
+
+        return $models;
+    }
+
+    /**
+     * Match the eagerly loaded results to their parents.
+     */
+    public function match(array $models, Collection $results, string $relation): array
+    {
+        return $this->matchOne($models, $results, $relation);
+    }
+
+    /**
+     * Match the eagerly loaded results to their single parents.
+     */
+    protected function matchOne(array $models, Collection $results, string $relation): array
+    {
+        $dictionary = $this->buildDictionary($results);
+
+        foreach ($models as $model) {
+            $key = $model->getAttribute($this->localKey);
+
+            if (isset($dictionary[$key])) {
+                $model->setRelation($relation, $dictionary[$key]);
+            }
+        }
+
+        return $models;
+    }
+
+    /**
+     * Build model dictionary keyed by the relation's foreign key.
+     */
+    protected function buildDictionary(Collection $results): array
+    {
+        $dictionary = [];
+
+        foreach ($results as $result) {
+            $dictionary[$result->getAttribute($this->foreignKey)] = $result;
+        }
+
+        return $dictionary;
+    }
+
+    /**
+     * Get the results of the relationship.
+     */
+    public function getResults(): ?Model
+    {
+        return $this->query->first();
+    }
+
+    /**
+     * Create a new instance of the related model.
+     */
+    public function create(array $attributes = []): Model
+    {
+        $instance = $this->related->newInstance($attributes);
+        
+        // Automatically set the foreign key
+        $instance->setAttribute($this->foreignKey, $this->getParentKey());
+        
+        $instance->save();
+
+        return $instance;
+    }
+
+    /**
+     * Update or create a related model.
+     */
+    public function updateOrCreate(array $attributes, array $values = []): Model
+    {
+        $instance = $this->query->first();
+
+        if ($instance) {
+            $instance->fill(array_merge($attributes, $values));
+            $instance->save();
+        } else {
+            $instance = $this->create(array_merge($attributes, $values));
+        }
+
+        return $instance;
+    }
+
+    /**
+     * Get the key value of the parent's local key.
+     */
+    protected function getParentKey(): mixed
+    {
+        return $this->parent->getAttribute($this->localKey);
+    }
+
+    /**
+     * Get the foreign key for the relationship.
+     */
+    public function getForeignKeyName(): string
+    {
+        return $this->foreignKey;
+    }
+
+    /**
+     * Get the local key for the relationship.
+     */
+    public function getLocalKeyName(): string
+    {
+        return $this->localKey;
+    }
+}

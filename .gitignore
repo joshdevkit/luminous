@@ -1,0 +1,4 @@
+/vendor
+/storage/*
+config.bat
+node_modules

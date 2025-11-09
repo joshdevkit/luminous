@@ -1,0 +1,634 @@
+<?php
+
+namespace Core\Framework;
+
+use App\Providers\AppServiceProvider;
+use Core\Auth\AuthServiceProvider;
+use Core\Contracts\ApplicationInterface;
+use Core\Contracts\Http\RequestInterface;
+use Core\Contracts\Http\ResponseInterface;
+use Core\Contracts\ServiceProviderInterface;
+use Core\Container\Container;
+use Core\Database\DatabaseServiceProvider;
+use Core\Exceptions\HttpErrorRenderer;
+use Core\Hashing\HashServiceProvider;
+use Core\Http\Middlewares\MiddlewareCollection;
+use Core\Http\Middlewares\VerifyCsrfToken;
+use Core\Http\Request;
+use Core\Http\Server;
+use Core\Providers\SymfonyErrorHandlerServiceProvider;
+use Core\Providers\WhoopsServiceProvider;
+use Core\RateLimit\RateLimitServiceProvider;
+use Core\Routing\Router;
+use Core\Session\SessionServiceProvider;
+use Core\Support\AliasLoader;
+use Dotenv\Dotenv;
+
+use function Core\Filesystem\join_paths;
+
+// class Application extends Container implements ApplicationInterface
+{
+    /**
+     * The framework version.
+     *
+     * @var string
+     */
+    const VERSION = '1.0';
+
+    /**
+     * Security error constant variable
+     */
+    public const SECURITY_ERROR = 'security_error';
+
+    /**
+     * The base path of the application.
+     *
+     * @var string
+     */
+    protected string $basePath;
+
+    /**
+     * All registered service providers.
+     *
+     * @var ServiceProviderInterface[]
+     */
+    protected array $serviceProviders = [];
+
+    /**
+     * Indicates whether the service providers have been booted.
+     *
+     * @var bool
+     */
+    protected bool $booted = false;
+
+    /**
+     * Indicates whether the application has completed bootstrapping.
+     *
+     * @var bool
+     */
+    protected bool $bootstrapped = false;
+
+    /**
+     * Global middleware collection.
+     *
+     * @var MiddlewareCollection
+     */
+    protected MiddlewareCollection $middleware;
+
+    /**
+     * Indicates if authentication is enabled.
+     *
+     * @var bool
+     */
+    protected bool $authEnabled = false;
+
+    /**
+     * The singleton instance of the application.
+     *
+     * @var self|null
+     */
+    protected static ?Application $instance = null;
+
+
+    /**
+     * Application constructor.
+     *
+     * @param string $basePath The base path of the application.
+     */
+    public function __construct(string $basePath)
+    {
+        $this->basePath = rtrim($basePath, '\/');
+        $this->middleware = new MiddlewareCollection();
+
+        $this->registerBaseBindings();
+        $this->registerBaseServiceProviders();
+        $this->bootstrap();  // Integrated from Program
+    }
+
+    /**
+     * Register base bindings in the container.
+     */
+    protected function registerBaseBindings(): void
+    {
+        static::setInstance($this);
+
+        $this->instance(ApplicationInterface::class, $this);
+        $this->instance('path', $this->path());
+        $this->instance('app', $this);
+        $this->instance('container', $this);
+        $this->instance('server', new Server($_SERVER));
+    }
+
+    /**
+     * Register base framework service providers.
+     */
+    protected function registerBaseServiceProviders(): void
+    {
+        $this->register(new SymfonyErrorHandlerServiceProvider());
+        // $this->register(new WhoopsServiceProvider());
+        $this->register(new DatabaseServiceProvider());
+        $this->register(new AppServiceProvider());
+        $this->register(new RateLimitServiceProvider());
+        $this->register(new SessionServiceProvider());
+        $this->register(new AuthServiceProvider());
+        $this->register(new HashServiceProvider());
+    }
+
+    /**
+     * Bootstrap the application (integrated from Program).
+     *
+     * @return ApplicationInterface
+     */
+    public function bootstrap(): ApplicationInterface
+    {
+        $this->bind(RequestInterface::class, Request::class);
+        $this->setAuthEnabled($this->authEnabled);
+
+        $this->instance('appPath', $this->basePath . '/app');
+        $this->instance('app_version', self::VERSION);
+
+        $this->loadEnvironment();
+        $this->registerCoreServices();
+        $this->loadConfiguration();
+        $this->registerServiceProviders();
+        $this->configureRouter();
+
+        $this->boot();
+        $this->AliasLoader();
+
+        return $this;
+    }
+
+    /**
+     * Load environment variables from the .env file (from Program).
+     */
+    protected function loadEnvironment(): void
+    {
+        if (!file_exists($this->basePath . '/.env')) {
+            return;
+        }
+
+        $dotenv = Dotenv::createImmutable($this->basePath);
+        $dotenv->load();
+    }
+
+    /**
+     * Register core services like config, router, and request (from Program).
+     */
+    protected function registerCoreServices(): void
+    {
+        $this->singleton('config', fn() => new \Core\Config\Repository());
+        $this->singleton('router', fn($c) => new Router($c));
+        $this->singleton('request', fn() => Request::capture());
+    }
+
+    /**
+     * Load configuration files from the config directory (from Program).
+     */
+    protected function loadConfiguration(): void
+    {
+        $config = $this->get('config');
+        $configPath = $this->basePath . '/config';
+
+        if (is_dir($configPath)) {
+            $config->loadDirectory($configPath);
+        }
+    }
+
+    /**
+     * Register application service providers (from Program).
+     */
+    protected function registerServiceProviders(): void
+    {
+        $providers = $this->getServiceProviders();
+
+        foreach ($providers as $providerClass) {
+            $this->register(new $providerClass());
+        }
+    }
+
+    /**
+     * Get the default set of service providers (from Program).
+     *
+     * @return string[]
+     */
+    protected function getServiceProviders(): array
+    {
+        $providers = [
+            \Core\Session\SessionServiceProvider::class,
+            \Core\View\ViewServiceProvider::class,
+            \Core\Database\DatabaseServiceProvider::class,
+        ];
+
+        if ($this->authEnabled) {
+            $providers[] = \Core\Auth\AuthServiceProvider::class;
+        }
+
+        return $providers;
+    }
+
+    /**
+     * Configure the router and auto-discover controller namespaces (from Program).
+     */
+    protected function configureRouter(): void
+    {
+        $router = $this->get('router');
+        $config = $this->get('config');
+
+        $routingConfig = $config->get('routing', []);
+
+        if (!($routingConfig['auto_discovery']['enabled'] ?? true)) {
+            return;
+        }
+
+        $namespaces = $routingConfig['namespaces'] ?? $this->getDefaultControllerNamespaces();
+
+        foreach ($namespaces as $namespace => $directory) {
+            if (is_dir($directory)) {
+                $router->addControllerNamespace($namespace, $directory);
+            }
+        }
+
+        if ($routingConfig['auto_discovery']['eager'] ?? false) {
+            $router->discoverRoutes();
+        }
+    }
+
+    /**
+     * Return default controller namespaces if none are configured (from Program).
+     *
+     * @return array<string, string>
+     */
+    protected function getDefaultControllerNamespaces(): array
+    {
+        return [
+            'App\\Controllers' => $this->basePath . '/app/Controllers',
+        ];
+    }
+
+    /**
+     * Get the application container instance.
+     *
+     * @return static
+     */
+    public function getContainer(): static
+    {
+        return $this;
+    }
+
+    /**
+     * Get the path to the application "app" directory.
+     *
+     * @param string $path Optional relative path.
+     * @return string
+     */
+    public function path(string $path = ''): string
+    {
+        $base = $this->has('appPath')
+            ? $this->get('appPath')
+            : $this->basePath('app');
+
+        return $this->joinPaths($base, $path);
+    }
+
+    /**
+     * Join two paths together.
+     *
+     * @param string $basePath
+     * @param string $path
+     * @return string
+     */
+    public function joinPaths($basePath, $path = ''): string
+    {
+        return join_paths($basePath, $path);
+    }
+
+    /**
+     * Get the base path of the application.
+     *
+     * @param string $path Optional relative path.
+     * @return string
+     */
+    public function basePath($path = ''): string
+    {
+        return $this->joinPaths($this->basePath, $path);
+    }
+
+    /**
+     * Register a service provider with the application.
+     *
+     * @param ServiceProviderInterface $provider
+     */
+    public function register(ServiceProviderInterface $provider): void
+    {
+        $provider->setContainer($this);
+        $provider->register();
+
+        $this->serviceProviders[] = $provider;
+    }
+
+    /**
+     * Boot all registered service providers.
+     */
+    public function boot(): void
+    {
+        if ($this->booted) {
+            return;
+        }
+
+        foreach ($this->serviceProviders as $provider) {
+            $provider->boot();
+        }
+
+        $this->booted = true;
+    }
+
+
+    public function AliasLoader()
+    {
+        $aliases = config('app.aliases', []);
+
+        if (empty($aliases)) {
+            $aliases = [
+                'Auth' => \Core\Facades\Auth::class,
+                'View' => \Core\Facades\View::class,
+                'DB' => \Core\Facades\DB::class,
+                'Hash' => \Core\Facades\Hash::class,
+                'Str' => \Core\Support\Str::class,
+            ];
+        }
+
+        $loader = AliasLoader::getInstance($aliases);
+        $loader->register();
+    }
+
+    /**
+     * Handle an incoming HTTP request.
+     *
+     * @param RequestInterface $request
+     * @return ResponseInterface
+     */
+    public function handle(RequestInterface $request): ResponseInterface
+    {
+        $this->validateAppKey();
+
+        $handler = fn($req) => $this->make('router')->dispatch($req);
+
+        // Iterate through middleware in reverse order for proper onion wrapping
+        foreach (array_reverse($this->middleware->all()) as $middlewareClass) {
+            $middleware = $this->make($middlewareClass);
+            $handler = fn($req) => $middleware->handle($req, $handler);
+        }
+
+        return $handler($request);
+    }
+
+    /**
+     * Validate the application encryption key.
+     *
+     * @throws \RuntimeException
+     */
+    protected function validateAppKey(): void
+    {
+        if (!$this->has('config')) {
+            return;
+        }
+
+        $config = $this->get('config');
+        $key = $config->get('app.key');
+        $cipher = $config->get('app.cipher', 'AES-256-CBC');
+
+        // Only validate in production or if explicitly enabled
+        if ($config->get('app.env') === 'production' || $config->get('app.validate_key', true)) {
+            AppKeyValidator::validate($key, $cipher);  
+        }
+    }
+
+    /**
+     * Determine if the application has been bootstrapped.
+     *
+     * @return bool
+     */
+    public function hasBeenBootstrapped(): bool
+    {
+        return $this->bootstrapped;
+    }
+
+    /**
+     * Get the singleton application instance (from Program).
+     *
+     * @return self|null
+     */
+    public static function init(): ?Application
+    {
+        return static::$instance;
+    }
+
+    /**
+     * Set the singleton application instance.
+     *
+     * @param self|null $app
+     */
+    protected static function setInstance(?Application $app): void
+    {
+        static::$instance = $app;
+    }
+
+    /**
+     * Add a global middleware class to the stack.
+     *
+     * @param string $middleware
+     * @param int $priority Optional priority (higher runs first)
+     * @return $this
+     */
+    public function addMiddleware(string $middleware, int $priority = 0): self
+    {
+        $this->middleware->add($middleware, $priority);
+        return $this;
+    }
+
+    /**
+     * Add a middleware to the beginning of the stack.
+     *
+     * @param string $middleware
+     * @return $this
+     */
+    public function prependMiddleware(string $middleware): self
+    {
+        $this->middleware->prepend($middleware);
+        return $this;
+    }
+
+    /**
+     * Remove a middleware from the stack.
+     *
+     * @param string $middleware
+     * @return $this
+     */
+    public function removeMiddleware(string $middleware): self
+    {
+        $this->middleware->remove($middleware);
+        return $this;
+    }
+
+    /**
+     * Replace a middleware with another one.
+     *
+     * @param string $old
+     * @param string $new
+     * @return $this
+     */
+    public function replaceMiddleware(string $old, string $new): self
+    {
+        $this->middleware->replace($old, $new);
+        return $this;
+    }
+
+    /**
+     * Get the middleware collection instance.
+     *
+     * @return MiddlewareCollection
+     */
+    public function getMiddlewareCollection(): MiddlewareCollection
+    {
+        return $this->middleware;
+    }
+
+    /**
+     * Get the stack of global middleware.
+     *
+     * @return string[]
+     */
+    public function getMiddleware(): array
+    {
+        return $this->middleware->all();
+    }
+
+    /**
+     * Check if a middleware exists in the stack.
+     *
+     * @param string $middleware
+     * @return bool
+     */
+    public function hasMiddleware(string $middleware): bool
+    {
+        return $this->middleware->contains($middleware);
+    }
+
+    /**
+     * Check if authentication is enabled.
+     *
+     * @return bool
+     */
+    public function isAuthEnabled(): bool
+    {
+        return $this->authEnabled;
+    }
+
+    /**
+     * Enable or disable authentication.
+     *
+     * @param bool $enabled
+     */
+    public function setAuthEnabled(bool $enabled): void
+    {
+        $this->authEnabled = $enabled;
+    }
+
+    /**
+     * Set middleware for the application (from Program).
+     *
+     * @param string[] $middleware
+     * @return $this
+     */
+    public function withMiddleware(array $middleware): self
+    {
+        $this->middleware->merge($middleware);
+        return $this;
+    }
+
+    /**
+     * Enable authentication for the application (from Program).
+     *
+     * @return $this
+     */
+    public function useAuthentication(): self
+    {
+        $this->authEnabled = true;
+        $this->setAuthEnabled(true);
+        return $this;
+    }
+
+    /**
+     * Validate that required security middleware is enabled (from Program).
+     *
+     * @throws \RuntimeException
+     */
+    protected function validateSecurityConfiguration(): bool
+    {
+        $missingMiddleware = [];
+
+        if (!$this->middleware->contains(VerifyCsrfToken::class)) {
+            $missingMiddleware[] = VerifyCsrfToken::class;
+        }
+
+        if (!empty($missingMiddleware)) {
+            $message = 'Critical security middleware is not configured. The application cannot start without proper security measures in place.';
+
+            $details = [
+                'missing_middleware' => implode(', ', $missingMiddleware),
+                'solution' => 'Add the missing middleware to your bootstrap configuration using $app->withMiddleware([...])',
+            ];
+
+            $this->instance(self::SECURITY_ERROR, HttpErrorRenderer::renderSecurityError($message, $details));
+            return false;
+        }
+
+        return true;
+    }
+
+    /**
+     * Get the current application version (from Program).
+     *
+     * @return string
+     */
+    public function getApplicationVersion(): string
+    {
+        return self::VERSION;
+    }
+
+    /**
+     * Run the application, dispatching the HTTP request and sending the response (from Program).
+     */
+    public function run(): void
+    {
+        // Add middleware to application
+        foreach ($this->middleware as $middleware) {
+            $this->addMiddleware($middleware);
+        }
+
+        if (!$this->validateSecurityConfiguration()) {
+            if ($this->has(self::SECURITY_ERROR)) {
+                $errorResponse = $this->get(self::SECURITY_ERROR);
+                $errorResponse->send();
+                exit(1);
+            }
+        }
+
+        // Normal request handling
+        $request = $this->get('request');
+        $response = $this->handle($request);
+        $response->send();
+    }
+
+    /**
+     * Magic getter to access container items directly.
+     *
+     * @param string $name
+     * @return mixed
+     */
+    public function __get(string $name)
+    {
+        return $this->get($name);
+    }
+}
